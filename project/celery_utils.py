@@ -1,13 +1,8 @@
 import functools
-from datetime import datetime
 
 from celery import current_app as current_celery_app, shared_task
-from celery.signals import task_revoked
 from celery.utils.time import get_exponential_backoff_interval
-from sqlalchemy import MetaData, Table
-
 from project.config import settings
-from project.database import SessionLocal, engine
 
 
 def create_celery():
@@ -67,29 +62,6 @@ class custom_celery_task:  # noqa
 
         return countdown
 
-
-# 使用反射載入 celery_taskmeta 表
-#
-# @task_revoked.connect
-# def on_task_revoked(request, terminated, signum, expired, **kwargs):
-#     task_id = request.id
-#
-#     session = SessionLocal()
-#     try:
-#         # 查詢任務
-#         task = session.query(celery_taskmeta).filter_by(task_id=task_id).first()
-#
-#         if task:
-#             task.status = 'REVOKED'
-#             task.date_done = datetime.utcnow()
-#
-#             # 提交變更
-#             session.commit()
-#     except Exception as e:
-#         session.rollback()
-#         raise e
-#     finally:
-#         session.close()
 
 
 

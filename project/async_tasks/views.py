@@ -1,15 +1,13 @@
 import logging
 
 from celery.result import AsyncResult
-from fastapi import Request, Depends, HTTPException
+from fastapi import Request, Depends, HTTPException, BackgroundTasks
 from fastapi.templating import Jinja2Templates
-from sqlalchemy.orm import Session
-
-from project.async_tasks.models import AsyncTask
-from project.async_tasks.schemas import async_task_schema
-from project.async_tasks.tasks import execute_task
-from project.constants import TaskStatus
-from project.database import get_db_session
+from sqlalchemy.ext.asyncio import AsyncSession
+from project.async_tasks.models import Task
+from project.async_tasks.schemas import task_schema
+from project.async_tasks.tasks import execute_task, execute_task_v2, cancel_task_v2
+from project.database import get_async_db_session
 from project.async_tasks import async_task_router
 
 logger = logging.getLogger(__name__)
@@ -17,23 +15,26 @@ templates = Jinja2Templates(directory="project/async_tasks/templates")
 
 
 @async_task_router.get("/form/")
-def form_example_get(request: Request):
+async def form_example_get(request: Request):
     return templates.TemplateResponse("form.html", {"request": request})
 
 
-@async_task_router.post("/form/")
-def create_async_tasks(payload: dict, session: Session = Depends(get_db_session)):
-    # TODO 修正，請使用AsyncTask
-    # FIXME 目前可以在內部拿到async_result id，可以自定義db資料對應celery_taskmeta
-    async_result = execute_task.delay('fake_id', payload)
-    print('async_result', async_result.id)
+@async_task_router.post("/")
+async def create_task(request: Request, session: AsyncSession = Depends(get_async_db_session)):
+    payload = await request.json()
+    payload = task_schema(payload)
+    task = Task(task_name=payload['task_name'])
+    async with session.begin():
+        session.add(task)
+        await session.commit()
 
-    return {"message": "consumer processing", "task_id": async_result.id}
+    result = execute_task.delay(task.id)
+
+    return {"message": "consumer processing", "task_id": result.id}
 
 
 @async_task_router.get("/{task_id}/status/")
-def get_async_task_status(task_id):
-    # TODO 修正，請使用AsyncTask
+async def get_async_task_status(task_id):
     task = AsyncResult(task_id)
     state = task.state
 
@@ -51,51 +52,50 @@ def get_async_task_status(task_id):
 
 
 @async_task_router.post("/{task_id}/cancel/")
-def cancel_task(task_id):
+async def cancel_task(task_id):
     result = AsyncResult(task_id)
     if result.state not in ['PENDING', 'STARTED']:
         return {"success": False, "message": "Task already completed or failed"}
 
     result.revoke(terminate=True)  # 終止任務
-    result.backend.store_result(task_id, result="Task was canceled", state="REVOKED")
+    result.backend.store_result(
+        task_id,
+        result={
+            "exc_type": "TaskRevokedError",
+            "exc_message": "Task was canceled"
+        },
+        state="REVOKED"
+    )
     return {"success": True, "message": "Task canceled"}
 
 
-# 以上為集成celery的異步功能實現
-# ------------------------------
-# 以下為使用FastAPI的BackgroundTask，示範使用async與await執行，確保不blocking
-# 此處就使用redis的部分
-# from fastapi import FastAPI, BackgroundTasks
-# import redis
-# import uuid
-# import json
-#
-# app = FastAPI()
-#
-# # 建立 Redis 連線
-# redis_client = redis.Redis(host='localhost', port=6379, decode_responses=True)
-#
-# STREAM_NAME = "my_stream"
-#
-# # Producer: 將消息加入 Redis Stream
-# @app.post("/produce/")
-# def produce_message(payload: dict):
-#     message_id = str(uuid.uuid4())
-#     redis_client.xadd(STREAM_NAME, {**payload, "message_id": message_id})
-#     return {"message": "Message produced", "id": message_id}
-#
-# # Consumer: 使用 BackgroundTasks 來模擬即時消費
-# @app.get("/consume/")
-# def consume_messages(background_tasks: BackgroundTasks):
-#     background_tasks.add_task(consume)
-#     return {"message": "Consumer started"}
-#
-# def consume():
-#     while True:
-#         # 阻塞式讀取 Redis Stream 中的消息
-#         messages = redis_client.xread({STREAM_NAME: "0"}, block=0)
-#         for stream, entries in messages:
-#             for entry_id, message in entries:
-#                 print(f"Consumed message: {message}")
-#                 # 處理完成後刪除該消息
-#                 redis_client.xdel(STREAM_NAME, entry_id)
+# 以下為使用FastAPI原生的BackgroundTasks，寫出作為參考，異步任務還是會建議結合celery
+
+@async_task_router.get("/v2/{task_id}")
+async def get_task_status_v2(task_id: int, session: AsyncSession = Depends(get_async_db_session)):
+    task = await session.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {"task_id": task.id, "status": task.status}
+
+
+@async_task_router.post("/v2/")
+async def create_task_v2(request: Request, background_tasks: BackgroundTasks,
+                         session: AsyncSession = Depends(get_async_db_session)):
+    payload = await request.json()
+    new_task = Task(task_name=payload['task_name'])
+    async with session.begin():
+        session.add(new_task)
+        await session.commit()
+
+    background_tasks.add_task(execute_task_v2, new_task.id, session)
+
+    return {"task_id": new_task.id, "status": new_task.status}
+
+
+@async_task_router.post("/v2/{task_id}/cancel")
+async def cancel_task(task_id: str, session: AsyncSession = Depends(get_async_db_session)):
+    success = await cancel_task_v2(task_id, session)
+    if not success:
+        raise HTTPException(status_code=400, detail="Task cannot be cancelled")
+    return {"message": "Task cancelled", "task_id": task_id}

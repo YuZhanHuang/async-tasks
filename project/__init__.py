@@ -4,7 +4,13 @@ from project.celery_utils import create_celery
 
 
 def create_app() -> FastAPI:
-    app = FastAPI()
+    app = FastAPI(
+        title="Async Tasks API",
+        description="Async Tasks API",
+        openapi_tags=[
+            {"name": "Tasks", "description": "Async Tasks Operations"},
+        ],
+    )
 
     from project.logging import configure_logging
     configure_logging()
